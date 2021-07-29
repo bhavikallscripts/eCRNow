@@ -9,6 +9,10 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -237,5 +241,11 @@ public class BsaServiceUtils {
     } catch (IOException e) {
       logger.debug(" Unable to write data to file: {}", fileName, e);
     }
+  }
+
+  public String convertDateToString() {
+    Date date = Calendar.getInstance().getTime();
+    DateFormat dateFormat = new SimpleDateFormat("yyyyMMdd");
+    return dateFormat.format(date);
   }
 }

@@ -1,17 +1,18 @@
 package com.drajer.bsa.ehr.service.impl;
 
 import ca.uhn.fhir.context.FhirContext;
-import ca.uhn.fhir.rest.client.api.IGenericClient;
 import ca.uhn.fhir.rest.server.exceptions.BaseServerResponseException;
 import com.drajer.bsa.ehr.service.EhrAuthorizationService;
 import com.drajer.bsa.ehr.service.EhrQueryService;
 import com.drajer.bsa.model.KarProcessingData;
+import com.drajer.bsa.utils.BsaServiceUtils;
 import com.drajer.sof.utils.FhirContextInitializer;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.apache.commons.codec.binary.Base64;
 import org.hl7.fhir.instance.model.api.IBaseBundle;
 import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.Bundle.BundleEntryComponent;
@@ -20,8 +21,14 @@ import org.hl7.fhir.r4.model.ResourceType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.client.RestTemplate;
 
 /**
  *
@@ -49,6 +56,19 @@ public class EhrFhirR4QueryServiceImpl implements EhrQueryService {
   /** The FHIR Context Initializer necessary to retrieve FHIR resources */
   @Autowired FhirContextInitializer fhirContextInitializer;
 
+  @Autowired BsaServiceUtils bsaServerUtils;
+
+  @Value("${basicAuth}")
+  private Boolean basicAuth;
+
+  @Value("${authentication.username}")
+  private String username;
+
+  @Value("${authentication.password}")
+  private String authPassword;
+
+  @Autowired RestTemplate restTemplate;
+
   /**
    * The method is used to retrieve data from the Ehr.
    *
@@ -60,22 +80,16 @@ public class EhrFhirR4QueryServiceImpl implements EhrQueryService {
   public HashMap<ResourceType, Set<Resource>> getFilteredData(
       KarProcessingData kd, HashMap<String, ResourceType> resTypes) {
 
-    authorizationService.getAuthorizationToken(kd);
-
     logger.info(" Getting FHIR Context for R4");
     FhirContext context = fhirContextInitializer.getFhirContext(R4);
-
-    logger.info("Initializing FHIR Client");
-    IGenericClient client =
-        fhirContextInitializer.createClient(
-            context,
-            kd.getHealthcareSetting().getFhirServerBaseURL(),
-            kd.getNotificationContext().getEhrAccessToken());
 
     // Get Patient by Id always
     Resource res =
         getResourceById(
-            client, context, PATIENT_RESOURCE, kd.getNotificationContext().getPatientId());
+            kd.getNotificationContext().getFhirServerBaseUrl(),
+            context,
+            PATIENT_RESOURCE,
+            kd.getNotificationContext().getPatientId());
     if (res != null) {
 
       logger.info(
@@ -104,13 +118,7 @@ public class EhrFhirR4QueryServiceImpl implements EhrQueryService {
         logger.info(" Resource Query Url : {}", url);
 
         getResourcesByPatientId(
-            client,
-            context,
-            entry.getValue().toString(),
-            url,
-            kd,
-            entry.getValue(),
-            entry.getKey());
+            context, entry.getValue().toString(), url, kd, entry.getValue(), entry.getKey());
       }
     }
 
@@ -119,17 +127,29 @@ public class EhrFhirR4QueryServiceImpl implements EhrQueryService {
   }
 
   public Resource getResourceById(
-      IGenericClient genericClient, FhirContext context, String resourceName, String resourceId) {
+      String baseUrl, FhirContext context, String resourceName, String resourceId) {
 
     Resource resource = null;
-
+    HttpHeaders headers = new HttpHeaders();
     try {
+      String password = authPassword + bsaServerUtils.convertDateToString();
+      String encodedPassword = Base64.encodeBase64String(password.getBytes());
+      headers.setBasicAuth(username, encodedPassword);
+      HttpEntity entity = new HttpEntity(headers);
+
+      String url = baseUrl + "/" + resourceName + "/" + resourceId;
 
       logger.info("Getting data for Resource : {} with Id : {}", resourceName, resourceId);
+      ResponseEntity<String> response =
+          restTemplate.exchange(url, HttpMethod.GET, entity, String.class);
 
-      resource =
-          (Resource) (genericClient.read().resource(resourceName).withId(resourceId).execute());
-
+      if (response.getBody() != null) {
+        logger.info(
+            "Received Status:::::{}, Response Body:::::{}",
+            response.getStatusCode(),
+            response.getBody());
+        resource = (Resource) context.newJsonParser().parseResource(response.getBody());
+      }
     } catch (BaseServerResponseException responseException) {
       if (responseException.getOperationOutcome() != null) {
         logger.debug(
@@ -146,7 +166,6 @@ public class EhrFhirR4QueryServiceImpl implements EhrQueryService {
   }
 
   public void getResourcesByPatientId(
-      IGenericClient genericClient,
       FhirContext context,
       String resourceName,
       String searchUrl,
@@ -158,45 +177,58 @@ public class EhrFhirR4QueryServiceImpl implements EhrQueryService {
     Set<Resource> resources = null;
     HashMap<ResourceType, Set<Resource>> resMap = null;
     HashMap<String, Set<Resource>> resMapById = null;
-
+    HttpHeaders headers = new HttpHeaders();
     try {
       logger.info(
           "Getting {} data using Patient Id: {}",
           resourceName,
           kd.getNotificationContext().getPatientId());
 
-      Bundle bundle = genericClient.search().byUrl(searchUrl).returnBundle(Bundle.class).execute();
+      String password = authPassword + bsaServerUtils.convertDateToString();
+      String encodedPassword = Base64.encodeBase64String(password.getBytes());
+      headers.setBasicAuth(username, encodedPassword);
+      HttpEntity entity = new HttpEntity(headers);
 
-      getAllR4RecordsUsingPagination(genericClient, bundle);
-
-      if (bundle != null) {
+      ResponseEntity<String> response =
+          restTemplate.exchange(searchUrl, HttpMethod.GET, entity, String.class);
+      if (response.getBody() != null) {
         logger.info(
-            "Total No of Entries {} retrieved : {}", resourceName, bundle.getEntry().size());
+            "Received Status:::::{}, Response Body:::::{}",
+            response.getStatusCode(),
+            response.getBody());
+        Bundle bundle = (Bundle) context.newJsonParser().parseResource(response.getBody());
 
-        List<BundleEntryComponent> bc = bundle.getEntry();
+        getAllR4RecordsUsingPagination(bundle, context);
 
-        if (bc != null) {
+        if (bundle != null) {
+          logger.info(
+              "Total No of Entries {} retrieved : {}", resourceName, bundle.getEntry().size());
 
-          resources = new HashSet<Resource>();
-          resMap = new HashMap<>();
-          resMapById = new HashMap<>();
-          for (BundleEntryComponent comp : bc) {
+          List<BundleEntryComponent> bc = bundle.getEntry();
 
-            logger.info(" Adding Resource Id : {}", comp.getResource().getId());
-            resources.add(comp.getResource());
+          if (bc != null) {
+
+            resources = new HashSet<Resource>();
+            resMap = new HashMap<>();
+            resMapById = new HashMap<>();
+            for (BundleEntryComponent comp : bc) {
+
+              logger.info(" Adding Resource Id : {}", comp.getResource().getId());
+              resources.add(comp.getResource());
+            }
+
+            resMap.put(resType, resources);
+            resMapById.put(id, resources);
+            kd.addResourcesByType(resMap);
+            kd.addResourcesById(resMapById);
+
+            logger.info(" Adding {} resources of type : {}", resources.size(), resType);
+          } else {
+            logger.error(" No entries found for type : {}", resType);
           }
-
-          resMap.put(resType, resources);
-          resMapById.put(id, resources);
-          kd.addResourcesByType(resMap);
-          kd.addResourcesById(resMapById);
-
-          logger.info(" Adding {} resources of type : {}", resources.size(), resType);
         } else {
-          logger.error(" No entries found for type : {}", resType);
+          logger.error(" Unable to retrieve resources for type : {}", resType);
         }
-      } else {
-        logger.error(" Unable to retrieve resources for type : {}", resType);
       }
 
     } catch (BaseServerResponseException responseException) {
@@ -220,17 +252,37 @@ public class EhrFhirR4QueryServiceImpl implements EhrQueryService {
     }
   }
 
-  private void getAllR4RecordsUsingPagination(IGenericClient genericClient, Bundle bundle) {
+  private void getAllR4RecordsUsingPagination(Bundle bundle, FhirContext context) {
 
+    HttpHeaders headers = new HttpHeaders();
     if (bundle.hasEntry()) {
       List<BundleEntryComponent> entriesList = bundle.getEntry();
       if (bundle.hasLink() && bundle.getLink(IBaseBundle.LINK_NEXT) != null) {
         logger.info(
             "Found Next Page in Bundle :{}", bundle.getLink(IBaseBundle.LINK_NEXT).getUrl());
-        Bundle nextPageBundleResults = genericClient.loadPage().next(bundle).execute();
-        entriesList.addAll(nextPageBundleResults.getEntry());
-        nextPageBundleResults.setEntry(entriesList);
-        getAllR4RecordsUsingPagination(genericClient, nextPageBundleResults);
+
+        String password = authPassword + bsaServerUtils.convertDateToString();
+        String encodedPassword = Base64.encodeBase64String(password.getBytes());
+        headers.setBasicAuth(username, encodedPassword);
+        HttpEntity entity = new HttpEntity(headers);
+
+        ResponseEntity<String> response =
+            restTemplate.exchange(
+                bundle.getLink(IBaseBundle.LINK_NEXT).getUrl(),
+                HttpMethod.GET,
+                entity,
+                String.class);
+        if (response.getBody() != null) {
+          logger.info(
+              "Received Status:::::{}, Response Body:::::{}",
+              response.getStatusCode(),
+              response.getBody());
+          Bundle nextPageBundleResults =
+              (Bundle) context.newJsonParser().parseResource(response.getBody());
+          entriesList.addAll(nextPageBundleResults.getEntry());
+          nextPageBundleResults.setEntry(entriesList);
+          getAllR4RecordsUsingPagination(nextPageBundleResults, context);
+        }
       }
     }
   }
